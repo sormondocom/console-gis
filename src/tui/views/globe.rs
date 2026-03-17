@@ -18,20 +18,23 @@ use ratatui::{
     widgets::Widget,
 };
 use crate::render::canvas::TerminalCapability;
-use crate::render::globe::{GlobeParams, pixel_color_pub, project_latlon};
-use crate::data::{WorldMap, Marker, GeoLayer};
+use crate::render::globe::{FrameConsts, GlobeParams, pixel_color_pub_fc, project_latlon};
+use crate::data::{WorldMap, Marker};
 use crate::data::markers::project_marker;
+use crate::tui::app::LayerEntry;
 
 pub struct GlobeView<'a> {
-    pub params:     &'a GlobeParams,
-    pub capability: TerminalCapability,
-    pub world:      &'a WorldMap,
-    pub markers:    &'a [Marker],
-    pub layers:     &'a [GeoLayer],
-    pub animating:  bool,
-    pub cursor_lat: f64,
-    pub cursor_lon: f64,
-    pub placing:    bool,
+    pub params:       &'a GlobeParams,
+    pub capability:   TerminalCapability,
+    pub world:        &'a WorldMap,
+    pub topo:         &'a crate::data::TopoMap,
+    pub topo_enabled: bool,
+    pub markers:      &'a [Marker],
+    pub layers:       &'a [LayerEntry],
+    pub animating:    bool,
+    pub cursor_lat:   f64,
+    pub cursor_lon:   f64,
+    pub placing:      bool,
 }
 
 impl<'a> Widget for GlobeView<'a> {
@@ -46,11 +49,14 @@ impl<'a> Widget for GlobeView<'a> {
         let cy     = ph as f64 / 2.0;
         let scale  = cx.min(cy) * 0.95;
 
+        // Pre-compute frame constants once — avoids 4 trig calls per pixel.
+        let fc = FrameConsts::new(self.params, cx, cy, scale);
+
         // ── Render sphere pixels ──────────────────────────────────────────────
         for row in 0..globe_rows {
             for col in 0..cols {
-                let top = pixel_color_pub(col, row * 2,     cx, cy, scale, self.params, self.world);
-                let bot = pixel_color_pub(col, row * 2 + 1, cx, cy, scale, self.params, self.world);
+                let top = pixel_color_pub_fc(col, row * 2,     &fc, self.world, self.topo, self.topo_enabled);
+                let bot = pixel_color_pub_fc(col, row * 2 + 1, &fc, self.world, self.topo, self.topo_enabled);
 
                 let cell = buf.get_mut(area.x + col as u16, area.y + row as u16);
 
@@ -125,19 +131,19 @@ impl<'a> Widget for GlobeView<'a> {
             RColor::Cyan, RColor::Yellow, RColor::Magenta, RColor::Green, RColor::Red,
         ];
 
-        for (li, layer) in self.layers.iter().enumerate() {
+        for entry in self.layers.iter().filter(|e| e.visible) {
             let fg = match self.capability {
                 TerminalCapability::TrueColor => {
-                    let c = TC_COLS[li % TC_COLS.len()];
+                    let c = TC_COLS[entry.color_index as usize % TC_COLS.len()];
                     RColor::Rgb(c.0, c.1, c.2)
                 }
-                _ => A8_COLS[li % A8_COLS.len()],
+                _ => A8_COLS[entry.color_index as usize % A8_COLS.len()],
             };
             let lstyle = Style::default().fg(fg);
             let seg_char = if self.capability.supports_unicode() { '·' } else { '.' };
 
             // ── Line segments: sample the arc to approximate great-circle paths
-            for ((lon0, lat0), (lon1, lat1)) in layer.segments() {
+            for ((lon0, lat0), (lon1, lat1)) in entry.layer.segments() {
                 // Sample up to 16 intermediate points along each segment so
                 // curves and longer edges look smooth at large zoom levels.
                 let dist = ((lat1 - lat0).powi(2) + (lon1 - lon0).powi(2)).sqrt();
@@ -168,7 +174,7 @@ impl<'a> Widget for GlobeView<'a> {
             }
 
             // ── Point coords (Point / MultiPoint features)
-            for (lon, lat) in layer.all_point_coords() {
+            for (lon, lat) in entry.layer.all_point_coords() {
                 if let Some((sc, sr)) = project_latlon(lat, lon, self.params, cx, cy / 2.0, scale) {
                     let tr = sr / 2;
                     if sc >= 0 && (sc as usize) < cols && tr >= 0 && (tr as usize) < globe_rows {
@@ -207,10 +213,11 @@ impl<'a> Widget for GlobeView<'a> {
         } else {
             "  [M] mark · [I] import · [Space] pause"
         };
+        let visible_count = self.layers.iter().filter(|e| e.visible).count();
         let layer_info = if self.layers.is_empty() {
             String::new()
         } else {
-            format!("  │  {} layer{}", self.layers.len(),
+            format!("  │  {}/{} layer{}", visible_count, self.layers.len(),
                 if self.layers.len() == 1 { "" } else { "s" })
         };
 

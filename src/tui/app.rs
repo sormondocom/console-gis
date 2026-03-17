@@ -5,7 +5,40 @@ use crate::geo::{BoundingBox, ConsoleResolution, LatLon};
 use crate::geo::zoom::RenderMode;
 use crate::render::canvas::TerminalCapability;
 use crate::render::globe::GlobeParams;
-use crate::data::{WorldMap, MarkerStore, GeoLayer};
+use crate::data::{WorldMap, MarkerStore, GeoLayer, TopoMap};
+use crate::data::geojson::GeoGeometry;
+
+// ── Layer entry ───────────────────────────────────────────────────────────────
+
+/// A GeoJSON layer plus display metadata owned by the application.
+pub struct LayerEntry {
+    pub layer:       GeoLayer,
+    pub visible:     bool,
+    /// Display name shown in the layer manager (defaults to filename stem).
+    pub label:       String,
+    /// Index (0–4) into the 5-colour palette, locked when the layer is added.
+    pub color_index: u8,
+}
+
+impl LayerEntry {
+    pub fn new(layer: GeoLayer, color_index: u8) -> Self {
+        let label = file_stem(&layer.source);
+        Self { layer, visible: true, label, color_index }
+    }
+
+    pub fn with_label(layer: GeoLayer, label: impl Into<String>, color_index: u8) -> Self {
+        Self { layer, visible: true, label: label.into(), color_index }
+    }
+}
+
+/// Extract the filename stem (no directory, no `.geojson`/`.json` extension).
+fn file_stem(path: &str) -> String {
+    let base = path.split(['/', '\\']).last().unwrap_or(path);
+    base.strip_suffix(".geojson")
+        .or_else(|| base.strip_suffix(".json"))
+        .unwrap_or(base)
+        .to_string()
+}
 
 // ── Marker placement / editing input ─────────────────────────────────────────
 
@@ -54,6 +87,20 @@ pub struct Bookmark {
     pub map_zoom:  u8,
 }
 
+/// Per-layer metadata saved across sessions (replaces the old `layer_paths`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SavedLayerEntry {
+    pub path:  String,
+    #[serde(default = "bool_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub label:   String,
+    #[serde(default)]
+    pub color_index: u8,
+}
+
+fn bool_true() -> bool { true }
+
 /// State that survives across sessions (written to disk on quit).
 ///
 /// Stored as JSON alongside the marker database so the same data directory
@@ -67,8 +114,12 @@ pub struct SavedState {
     pub globe_rot_y:  f64,
     pub globe_rot_x:  f64,
     pub globe_zoom:   f64,
-    /// Absolute paths of GeoJSON files that were loaded last session.
+    /// Absolute paths of GeoJSON files that were loaded last session (legacy).
+    #[serde(default)]
     pub layer_paths:  Vec<String>,
+    /// Per-layer metadata saved across sessions (replaces the old `layer_paths`).
+    #[serde(default)]
+    pub layer_entries: Vec<SavedLayerEntry>,
     /// Named saved view positions.
     #[serde(default)]
     pub bookmarks:    Vec<Bookmark>,
@@ -77,14 +128,15 @@ pub struct SavedState {
 impl Default for SavedState {
     fn default() -> Self {
         Self {
-            map_lat:     20.0,
-            map_lon:     10.0,
-            map_zoom:    2,
-            globe_rot_y: 0.0,
-            globe_rot_x: 0.0,
-            globe_zoom:  1.0,
-            layer_paths: Vec::new(),
-            bookmarks:   Vec::new(),
+            map_lat:      20.0,
+            map_lon:      10.0,
+            map_zoom:     2,
+            globe_rot_y:  0.0,
+            globe_rot_x:  0.0,
+            globe_zoom:   1.0,
+            layer_paths:  Vec::new(),
+            layer_entries: Vec::new(),
+            bookmarks:    Vec::new(),
         }
     }
 }
@@ -122,6 +174,10 @@ pub struct App {
     pub should_quit:    bool,
     /// Shared world map data (no heap allocation after construction).
     pub world:          WorldMap,
+    /// Topographic elevation layer on/off.  On by default.
+    pub topo_enabled: bool,
+    /// Shared topographic elevation data (zero allocation after construction).
+    pub topo:         TopoMap,
     /// Persistent geographic annotations.
     pub markers:        MarkerStore,
     /// True when the marker-placement crosshair is shown (globe/map moves the
@@ -142,9 +198,13 @@ pub struct App {
 
     // ── GeoJSON layer management ──────────────────────────────────────────────
     /// In-memory GeoJSON layers.  Rendered on both map and globe views.
-    pub geo_layers:     Vec<GeoLayer>,
+    pub geo_layers:     Vec<LayerEntry>,
     /// True when the GeoJSON file-path input overlay is active.
     pub importing:      bool,
+    /// Selected row in the layer-manager view.
+    pub layer_list_sel:  usize,
+    /// View to return to when leaving the layer-manager (Globe or Map).
+    pub layers_prev_view: View,
     /// Current text in the import path input box.
     pub import_buf:     String,
     /// Last import error (displayed in the overlay until cleared).
@@ -193,6 +253,8 @@ impl App {
             animating:      true,
             should_quit:    false,
             world:          WorldMap::new(),
+            topo_enabled:   true,
+            topo:           TopoMap::new(),
             markers,
             placing_marker:     false,
             globe_cursor:       LatLon::new(0.0, 0.0),
@@ -200,9 +262,11 @@ impl App {
             marker_list_sel:    0,
             marker_del_confirm: false,
             geo_layers:         Vec::new(),
-            importing:        false,
-            import_buf:       String::new(),
-            import_error:     None,
+            importing:          false,
+            layer_list_sel:     0,
+            layers_prev_view:   View::Menu,
+            import_buf:         String::new(),
+            import_error:       None,
             clearing_markers: false,
             bookmarking:      false,
             bookmark_buf:     String::new(),
@@ -215,23 +279,60 @@ impl App {
     /// Missing or unreadable files produce a warning entry in `import_error`
     /// rather than a hard failure.  The returned vec contains one warning
     /// string per failed path.
-    pub fn restore_layers(&mut self, paths: &[String]) -> Vec<String> {
+    pub fn restore_layers(&mut self, saved: &SavedState) -> Vec<String> {
         let mut warnings = Vec::new();
-        for path_str in paths {
-            let p = PathBuf::from(path_str);
-            if !p.exists() {
-                warnings.push(format!(
-                    "GeoJSON not found (skipped): {}",
-                    p.display()
-                ));
-                continue;
+        if !saved.layer_entries.is_empty() {
+            // New format: load from layer_entries
+            for entry in &saved.layer_entries {
+                let p = PathBuf::from(&entry.path);
+                if !p.exists() {
+                    warnings.push(format!(
+                        "GeoJSON not found (skipped): {}",
+                        p.display()
+                    ));
+                    continue;
+                }
+                match GeoLayer::load(&p) {
+                    Ok(layer) => {
+                        let label = if entry.label.is_empty() {
+                            file_stem(&layer.source)
+                        } else {
+                            entry.label.clone()
+                        };
+                        self.geo_layers.push(LayerEntry {
+                            layer,
+                            visible:     entry.visible,
+                            label,
+                            color_index: entry.color_index,
+                        });
+                    }
+                    Err(e) => warnings.push(format!(
+                        "Could not load {} — {}",
+                        p.display(), e
+                    )),
+                }
             }
-            match GeoLayer::load(&p) {
-                Ok(layer) => self.geo_layers.push(layer),
-                Err(e) => warnings.push(format!(
-                    "Could not load {} — {}",
-                    p.display(), e
-                )),
+        } else {
+            // Legacy format: load from layer_paths with sequential color_index
+            for (idx, path_str) in saved.layer_paths.iter().enumerate() {
+                let p = PathBuf::from(path_str);
+                if !p.exists() {
+                    warnings.push(format!(
+                        "GeoJSON not found (skipped): {}",
+                        p.display()
+                    ));
+                    continue;
+                }
+                match GeoLayer::load(&p) {
+                    Ok(layer) => {
+                        let color_index = idx as u8 % 5;
+                        self.geo_layers.push(LayerEntry::new(layer, color_index));
+                    }
+                    Err(e) => warnings.push(format!(
+                        "Could not load {} — {}",
+                        p.display(), e
+                    )),
+                }
             }
         }
         warnings
@@ -251,7 +352,45 @@ impl App {
         match GeoLayer::load(&p) {
             Ok(layer) => {
                 self.import_error = None;
-                self.geo_layers.push(layer);
+                let color_index = self.geo_layers.len() as u8 % 5;
+                self.geo_layers.push(LayerEntry::new(layer, color_index));
+                true
+            }
+            Err(e) => {
+                self.import_error = Some(format!("Load error: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Import a GeoJSON file split into one sub-layer per geometry type.
+    /// Returns true on success. On failure sets import_error.
+    pub fn load_geo_layer_split(&mut self, path: &str) -> bool {
+        let p = PathBuf::from(path.trim());
+        if !p.exists() {
+            self.import_error = Some(format!("File not found: {}", p.display()));
+            return false;
+        }
+        match GeoLayer::load(&p) {
+            Ok(base_layer) => {
+                let stem = file_stem(&base_layer.source);
+                let sub_layers = base_layer.split_by_geometry_type();
+                // Determine type suffix label for each sub-layer
+                let type_labels: Vec<&str> = sub_layers.iter().map(|sl| {
+                    if sl.features.iter().all(|f| matches!(
+                        f.geometry, GeoGeometry::Point(_) | GeoGeometry::MultiPoint(_)
+                    )) { "Points" }
+                    else if sl.features.iter().all(|f| matches!(
+                        f.geometry, GeoGeometry::Polygon(_) | GeoGeometry::MultiPolygon(_)
+                    )) { "Polygons" }
+                    else { "Lines" }
+                }).collect();
+                for (sl, type_label) in sub_layers.into_iter().zip(type_labels) {
+                    let color_index = self.geo_layers.len() as u8 % 5;
+                    let label = format!("{} ({})", stem, type_label);
+                    self.geo_layers.push(LayerEntry::with_label(sl, label, color_index));
+                }
+                self.import_error = None;
                 true
             }
             Err(e) => {
@@ -265,16 +404,20 @@ impl App {
     pub fn save_state(&self) {
         let existing = SavedState::load(&self.state_path);
         let saved = SavedState {
-            map_lat:     self.map_centre.lat,
-            map_lon:     self.map_centre.lon,
-            map_zoom:    self.zoom,
-            globe_rot_y: self.globe.rot_y,
-            globe_rot_x: self.globe.rot_x,
-            globe_zoom:  self.globe.zoom,
-            layer_paths: self.geo_layers.iter()
-                .map(|l| l.source.clone())
-                .collect(),
-            bookmarks:   existing.bookmarks,  // preserve bookmarks across sessions
+            map_lat:      self.map_centre.lat,
+            map_lon:      self.map_centre.lon,
+            map_zoom:     self.zoom,
+            globe_rot_y:  self.globe.rot_y,
+            globe_rot_x:  self.globe.rot_x,
+            globe_zoom:   self.globe.zoom,
+            layer_paths:  Vec::new(),   // legacy field; layer_entries is canonical
+            layer_entries: self.geo_layers.iter().map(|e| SavedLayerEntry {
+                path:        e.layer.source.clone(),
+                visible:     e.visible,
+                label:       e.label.clone(),
+                color_index: e.color_index,
+            }).collect(),
+            bookmarks:    existing.bookmarks,  // preserve bookmarks across sessions
         };
         saved.save(&self.state_path);
     }
@@ -425,4 +568,5 @@ pub enum View {
     MarkerList,
     ZoomExplorer,
     Diagnostics,
+    Layers,
 }

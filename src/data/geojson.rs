@@ -143,6 +143,45 @@ impl GeoLayer {
     pub fn all_point_coords(&self) -> impl Iterator<Item = Coord> + '_ {
         self.features.iter().flat_map(|f| geometry_points(&f.geometry))
     }
+
+    /// Split this layer into sub-layers grouped by geometry category.
+    ///
+    /// Returns up to three `GeoLayer`s (one each for Points, Lines, Polygons).
+    /// Each sub-layer keeps the same `source` path.
+    /// Returns a single-element vec if all features are the same type.
+    pub fn split_by_geometry_type(&self) -> Vec<Self> {
+        let mut point_feats   = Vec::new();
+        let mut line_feats    = Vec::new();
+        let mut polygon_feats = Vec::new();
+
+        for f in &self.features {
+            match &f.geometry {
+                GeoGeometry::Point(_) | GeoGeometry::MultiPoint(_) =>
+                    point_feats.push(f.clone()),
+                GeoGeometry::LineString(_) | GeoGeometry::MultiLineString(_) =>
+                    line_feats.push(f.clone()),
+                GeoGeometry::Polygon(_) | GeoGeometry::MultiPolygon(_) =>
+                    polygon_feats.push(f.clone()),
+                GeoGeometry::Collection(_) =>
+                    line_feats.push(f.clone()),  // mixed → lines bucket
+            }
+        }
+
+        let mut result = Vec::new();
+        if !point_feats.is_empty() {
+            result.push(GeoLayer { source: self.source.clone(), features: point_feats });
+        }
+        if !line_feats.is_empty() {
+            result.push(GeoLayer { source: self.source.clone(), features: line_feats });
+        }
+        if !polygon_feats.is_empty() {
+            result.push(GeoLayer { source: self.source.clone(), features: polygon_feats });
+        }
+        if result.is_empty() {
+            result.push(self.clone());
+        }
+        result
+    }
 }
 
 // ── Geometry helpers ──────────────────────────────────────────────────────────
@@ -407,5 +446,73 @@ mod tests {
     fn bare_geometry() {
         let layer = parse(r#"{"type":"Point","coordinates":[10.0,20.0]}"#);
         assert_eq!(layer.features.len(), 1);
+    }
+
+    #[test]
+    fn split_by_geometry_type_mixed() {
+        let layer = parse(r#"{
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": { "type": "Point", "coordinates": [0.0, 0.0] },
+                    "properties": {}
+                },
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [[0,0],[1,1]]
+                    },
+                    "properties": {}
+                },
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0,0],[1,0],[1,1],[0,0]]]
+                    },
+                    "properties": {}
+                }
+            ]
+        }"#);
+        let sub = layer.split_by_geometry_type();
+        assert_eq!(sub.len(), 3);
+        assert_eq!(sub[0].features.len(), 1);
+        assert!(matches!(sub[0].features[0].geometry, GeoGeometry::Point(_)));
+        assert_eq!(sub[1].features.len(), 1);
+        assert!(matches!(sub[1].features[0].geometry, GeoGeometry::LineString(_)));
+        assert_eq!(sub[2].features.len(), 1);
+        assert!(matches!(sub[2].features[0].geometry, GeoGeometry::Polygon(_)));
+    }
+
+    #[test]
+    fn split_by_geometry_type_single_type() {
+        let layer = parse(r#"{
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": { "type": "Point", "coordinates": [1.0, 2.0] },
+                    "properties": {}
+                },
+                {
+                    "type": "Feature",
+                    "geometry": { "type": "Point", "coordinates": [3.0, 4.0] },
+                    "properties": {}
+                }
+            ]
+        }"#);
+        let sub = layer.split_by_geometry_type();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].features.len(), 2);
+    }
+
+    #[test]
+    fn split_by_geometry_type_empty() {
+        let layer = GeoLayer { source: "test".into(), features: Vec::new() };
+        let sub = layer.split_by_geometry_type();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].features.len(), 0);
     }
 }

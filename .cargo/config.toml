@@ -1,0 +1,5 @@
+[build]
+# Compile for the host CPU's native ISA — enables AVX2/FMA auto-vectorization
+# by LLVM without explicit #[target_feature] annotations in source.
+# Do not commit this file to a shared repo if binaries must run on older CPUs.
+rustflags = ["-C", "target-cpu=native"]

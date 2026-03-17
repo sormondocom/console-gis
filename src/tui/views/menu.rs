@@ -45,6 +45,13 @@ pub const MENU_ITEMS: &[MenuItem] = &[
         icon:  "≡",
         desc:  "Colour capability, character metrics, effective DPI, render mode.",
     },
+    MenuItem {
+        key:   '6',
+        label: "Layers",
+        view:  View::Layers,
+        icon:  "≋",
+        desc:  "Manage imported GeoJSON layers — toggle visibility, delete, view details.\n\nControls: ↑↓ navigate · Space toggle visibility · D delete · Esc back",
+    },
 ];
 
 pub struct MenuItem {

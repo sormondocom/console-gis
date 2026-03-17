@@ -25,6 +25,7 @@ use console_gis::{
             markers::MarkerListView,
             zoom_explorer::ZoomExplorerView,
             diagnostics::DiagnosticsView,
+            layers::LayerManagerView,
         },
     },
 };
@@ -70,7 +71,7 @@ fn run_app(
 ) -> io::Result<()> {
     let mut app = App::new(capability, markers_store, state_path, saved);
 
-    let restore_warnings = app.restore_layers(&saved.layer_paths.clone());
+    let restore_warnings = app.restore_layers(&saved);
     if !restore_warnings.is_empty() {
         app.import_error = Some(restore_warnings.join("\n"));
     }
@@ -112,15 +113,17 @@ fn run_app(
                 View::Globe => {
                     f.render_widget(
                         GlobeView {
-                            params:     &app.globe,
+                            params:       &app.globe,
                             capability,
-                            world:      &app.world,
-                            markers:    &all_markers,
-                            layers:     &app.geo_layers,
-                            animating:  app.animating,
-                            cursor_lat: app.globe_cursor.lat,
-                            cursor_lon: app.globe_cursor.lon,
-                            placing:    app.placing_marker,
+                            world:        &app.world,
+                            topo:         &app.topo,
+                            topo_enabled: app.topo_enabled,
+                            markers:      &all_markers,
+                            layers:       &app.geo_layers,
+                            animating:    app.animating,
+                            cursor_lat:   app.globe_cursor.lat,
+                            cursor_lon:   app.globe_cursor.lon,
+                            placing:      app.placing_marker,
                         },
                         area,
                     );
@@ -128,15 +131,17 @@ fn run_app(
                 View::Map => {
                     f.render_widget(
                         MapView {
-                            center_lat:  app.map_centre.lat,
-                            center_lon:  app.map_centre.lon,
-                            zoom:        app.zoom,
+                            center_lat:   app.map_centre.lat,
+                            center_lon:   app.map_centre.lon,
+                            zoom:         app.zoom,
                             capability,
-                            world:       &app.world,
-                            markers:     &all_markers,
-                            layers:      &app.geo_layers,
-                            resolution:  &app.resolution,
-                            placing:     app.placing_marker,
+                            world:        &app.world,
+                            topo:         &app.topo,
+                            topo_enabled: app.topo_enabled,
+                            markers:      &all_markers,
+                            layers:       &app.geo_layers,
+                            resolution:   &app.resolution,
+                            placing:      app.placing_marker,
                         },
                         area,
                     );
@@ -165,6 +170,17 @@ fn run_app(
                             cols,
                             rows,
                             char_aspect: app.resolution.char_aspect,
+                        },
+                        area,
+                    );
+                }
+                View::Layers => {
+                    f.render_widget(
+                        LayerManagerView {
+                            layers:       &app.geo_layers,
+                            selected:     app.layer_list_sel,
+                            capability,
+                            topo_enabled: app.topo_enabled,
                         },
                         area,
                     );
@@ -232,7 +248,7 @@ fn run_app(
                 let fg  = if tc { Color::Rgb(30, 200, 240) } else { Color::Cyan };
                 let ef  = if tc { Color::Rgb(220, 80, 80)  } else { Color::Red  };
 
-                let title      = " Import GeoJSON — enter file path (Tab=clear  Esc=cancel  Enter=load) ";
+                let title      = " Import GeoJSON — enter file path (Tab=clear  Esc=cancel  Enter=single layer  S=split by type) ";
                 let input_line = format!(" > {}█", app.import_buf);
                 let err_line   = match &app.import_error {
                     Some(e) => format!(" ⚠  {e}"),
@@ -464,6 +480,49 @@ fn run_app(
                     continue;
                 }
 
+                // ── Layers view key handling ──────────────────────────────────
+                if app.view == View::Layers {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            app.view = app.layers_prev_view;
+                        }
+                        KeyCode::Up => {
+                            if app.layer_list_sel > 0 { app.layer_list_sel -= 1; }
+                        }
+                        KeyCode::Down => {
+                            // 0 = built-in topo, 1..=N = geo layers
+                            if app.layer_list_sel < app.geo_layers.len() {
+                                app.layer_list_sel += 1;
+                            }
+                        }
+                        KeyCode::Char(' ') | KeyCode::Enter => {
+                            if app.layer_list_sel == 0 {
+                                // Toggle built-in topo layer
+                                app.topo_enabled = !app.topo_enabled;
+                            } else if let Some(e) = app.geo_layers.get_mut(app.layer_list_sel - 1) {
+                                e.visible = !e.visible;
+                            }
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            if app.layer_list_sel == 0 {
+                                // Built-in layer cannot be deleted
+                            } else {
+                                let geo_idx = app.layer_list_sel - 1;
+                                if geo_idx < app.geo_layers.len() {
+                                    app.geo_layers.remove(geo_idx);
+                                    if app.layer_list_sel > 0
+                                        && app.layer_list_sel > app.geo_layers.len()
+                                    {
+                                        app.layer_list_sel -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // ── Import overlay ────────────────────────────────────────────
                 if app.importing {
                     match key.code {
@@ -473,6 +532,13 @@ fn run_app(
                         KeyCode::Enter => {
                             let path = app.import_buf.clone();
                             if app.load_geo_layer(&path) {
+                                app.importing  = false;
+                                app.import_buf = String::new();
+                            }
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            let path = app.import_buf.clone();
+                            if app.load_geo_layer_split(&path) {
                                 app.importing  = false;
                                 app.import_buf = String::new();
                             }
@@ -576,6 +642,9 @@ fn run_app(
                         KeyCode::Esc | KeyCode::Char('q') => app.navigate(View::Menu),
                         _ => {}
                     },
+
+                    // View::Layers is handled above with an early `continue`.
+                    View::Layers => {}
                 }
             }
         }
@@ -646,12 +715,20 @@ fn handle_globe_keys(app: &mut App, code: KeyCode) {
                 app.import_buf.clear();
                 app.import_error = None;
             }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                app.layers_prev_view = app.view;
+                app.layer_list_sel   = 0;
+                app.view             = View::Layers;
+            }
             KeyCode::Char('b') | KeyCode::Char('B') => {
                 app.bookmarking = true;
                 app.bookmark_buf.clear();
             }
             KeyCode::Char('x') | KeyCode::Char('X') => {
                 if app.markers.count() > 0 { app.clearing_markers = true; }
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                app.topo_enabled = !app.topo_enabled;
             }
             _ => {}
         }
@@ -700,12 +777,20 @@ fn handle_map_keys(app: &mut App, code: KeyCode) {
                 app.import_buf.clear();
                 app.import_error = None;
             }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                app.layers_prev_view = app.view;
+                app.layer_list_sel   = 0;
+                app.view             = View::Layers;
+            }
             KeyCode::Char('b') | KeyCode::Char('B') => {
                 app.bookmarking = true;
                 app.bookmark_buf.clear();
             }
             KeyCode::Char('x') | KeyCode::Char('X') => {
                 if app.markers.count() > 0 { app.clearing_markers = true; }
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                app.topo_enabled = !app.topo_enabled;
             }
             _ => {}
         }

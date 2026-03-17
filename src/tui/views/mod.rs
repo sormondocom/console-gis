@@ -5,3 +5,4 @@ pub mod map;
 pub mod markers;
 pub mod zoom_explorer;
 pub mod diagnostics;
+pub mod layers;

@@ -19,8 +19,9 @@ use ratatui::{
     widgets::Widget,
 };
 use crate::render::canvas::TerminalCapability;
-use crate::data::{WorldMap, Marker, GeoLayer};
+use crate::data::{WorldMap, Marker};
 use crate::geo::zoom::ConsoleResolution;
+use crate::tui::app::LayerEntry;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -37,7 +38,7 @@ const POLAR:   (u8, u8, u8) = ( 80, 130, 160);
 // ── Pixel classifier ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-enum PixelKind { Ocean, Land, Grid, Equator, Tropic, Polar }
+enum PixelKind { Ocean, Land(u8), Grid, Equator, Tropic, Polar }
 
 /// Forward Mercator: (lat_deg, lon_deg) → (merc_x_m, merc_y_m).
 #[inline]
@@ -84,34 +85,49 @@ fn classify(
     cmerc_x: f64, cmerc_y: f64,
     grid_deg: f64, thresh: f64,
     world: &WorldMap,
+    topo: &crate::data::TopoMap,
+    topo_enabled: bool,
 ) -> PixelKind {
     let (lat, lon) = merc_inv(
         cmerc_x + (px - cx_px) * mpp,
         cmerc_y - (py - cy_px) * mpp_y,   // screen y↓ = geo y↑
     );
 
-    // Special parallels (drawn at 2× normal threshold so they're visible)
-    if lat.abs() < thresh * 2.0                             { return PixelKind::Equator; }
-    if (lat - 23.5).abs() < thresh * 2.0
-    || (lat + 23.5).abs() < thresh * 2.0                   { return PixelKind::Tropic; }
-    if (lat - 66.5).abs() < thresh * 2.0
-    || (lat + 66.5).abs() < thresh * 2.0                   { return PixelKind::Polar; }
+    // Mercator-corrected latitude threshold: at latitude φ, 1° of lat spans
+    // 1/cos(φ) more screen pixels than at the equator, so the threshold in
+    // degrees must shrink by cos(φ) to keep lines one pixel wide.
+    let lat_thresh = thresh * lat.to_radians().cos().max(0.1);
 
-    if on_grid(lat, grid_deg, thresh) || on_grid(lon, grid_deg, thresh) {
+    // Special parallels (drawn at 2× normal threshold so they're visible)
+    if lat.abs() < lat_thresh * 2.0                             { return PixelKind::Equator; }
+    if (lat - 23.5).abs() < lat_thresh * 2.0
+    || (lat + 23.5).abs() < lat_thresh * 2.0                   { return PixelKind::Tropic; }
+    if (lat - 66.5).abs() < lat_thresh * 2.0
+    || (lat + 66.5).abs() < lat_thresh * 2.0                   { return PixelKind::Polar; }
+
+    if on_grid(lat, grid_deg, lat_thresh) || on_grid(lon, grid_deg, thresh) {
         return PixelKind::Grid;
     }
 
-    if world.is_land(lat, lon) { PixelKind::Land } else { PixelKind::Ocean }
+    if world.is_land(lat, lon) {
+        let tier = if topo_enabled { topo.elevation_tier(lat, lon) } else { 0 };
+        PixelKind::Land(tier)
+    } else {
+        PixelKind::Ocean
+    }
 }
 
 fn kind_rgb(k: PixelKind) -> (u8, u8, u8) {
     match k {
-        PixelKind::Ocean   => OCEAN,
-        PixelKind::Land    => LAND,
-        PixelKind::Grid    => GRID,
-        PixelKind::Equator => EQUATOR,
-        PixelKind::Tropic  => TROPIC,
-        PixelKind::Polar   => POLAR,
+        PixelKind::Ocean      => OCEAN,
+        PixelKind::Land(0)    => LAND,
+        PixelKind::Land(1)    => (70, 110, 40),
+        PixelKind::Land(2)    => (110, 90, 60),
+        PixelKind::Land(_)    => (200, 200, 210),
+        PixelKind::Grid       => GRID,
+        PixelKind::Equator    => EQUATOR,
+        PixelKind::Tropic     => TROPIC,
+        PixelKind::Polar      => POLAR,
     }
 }
 
@@ -121,7 +137,10 @@ fn kind_rgb(k: PixelKind) -> (u8, u8, u8) {
 fn kind_ascii(k: PixelKind) -> char {
     match k {
         PixelKind::Ocean   => ' ',
-        PixelKind::Land    => ':',
+        PixelKind::Land(0) => ',',
+        PixelKind::Land(1) => ':',
+        PixelKind::Land(2) => '^',
+        PixelKind::Land(_) => '#',
         PixelKind::Grid    => '.',
         PixelKind::Equator => '=',
         PixelKind::Tropic  => '-',
@@ -141,11 +160,13 @@ fn ascii_shade(lum: u8) -> char {
 /// Best-effort ANSI-8 colour approximation for a map RGB value.
 fn ansi_color(rgb: (u8, u8, u8)) -> RColor {
     let (r, g, b) = rgb;
+    if r > 180 && g > 180 && b > 180 { return RColor::White;  } // snow/ice (tier 3)
     if r > 150 && g > 130 && b < 60  { return RColor::Yellow; } // equator / gold
     if r > 100 && g > 60  && b < 50  { return RColor::Yellow; } // tropics (orange)
-    if b < 100 && g > 100 && r < 100 { return RColor::Cyan;   } // polar ice
+    if b < 100 && g > 100 && r < 100 { return RColor::Cyan;   } // polar
     if b > r   && b > g              { return RColor::Blue;   } // ocean
-    if g > r   && g > b              { return RColor::Green;  } // land
+    if g > r   && g > b              { return RColor::Green;  } // land (tiers 0–1)
+    if r > g   && r > b              { return RColor::Red;    } // brownish (tier 2)
     let lum = (r as u16 + g as u16 + b as u16) / 3;
     if lum < 40 { RColor::Black } else { RColor::DarkGray }
 }
@@ -159,8 +180,10 @@ pub struct MapView<'a> {
     pub zoom:        u8,
     pub capability:  TerminalCapability,
     pub world:       &'a WorldMap,
+    pub topo:        &'a crate::data::TopoMap,
+    pub topo_enabled: bool,
     pub markers:     &'a [Marker],
-    pub layers:      &'a [GeoLayer],
+    pub layers:      &'a [LayerEntry],
     pub resolution:  &'a ConsoleResolution,
     /// True when the marker-placement crosshair overlay is active.
     pub placing:     bool,
@@ -203,10 +226,10 @@ impl<'a> Widget for MapView<'a> {
                 if use_hb {
                     let top = kind_rgb(classify(cx_f, (row * 2) as f64,
                         cx_px, cy_px, mpp, mpp_y, cmerc_x, cmerc_y,
-                        grid_deg, thresh_deg, self.world));
+                        grid_deg, thresh_deg, self.world, self.topo, self.topo_enabled));
                     let bot = kind_rgb(classify(cx_f, (row * 2 + 1) as f64,
                         cx_px, cy_px, mpp, mpp_y, cmerc_x, cmerc_y,
-                        grid_deg, thresh_deg, self.world));
+                        grid_deg, thresh_deg, self.world, self.topo, self.topo_enabled));
 
                     match self.capability {
                         TerminalCapability::TrueColor => {
@@ -228,7 +251,7 @@ impl<'a> Widget for MapView<'a> {
                     // ASCII / Block / VT-100: one character per cell
                     let k = classify(cx_f, row as f64,
                         cx_px, cy_px, mpp, mpp_y, cmerc_x, cmerc_y,
-                        grid_deg, thresh_deg, self.world);
+                        grid_deg, thresh_deg, self.world, self.topo, self.topo_enabled);
 
                     cell.set_char(kind_ascii(k));
                     if matches!(self.capability,
@@ -295,9 +318,9 @@ impl<'a> Widget for MapView<'a> {
             RColor::Green, RColor::Red,
         ];
 
-        for (li, layer) in self.layers.iter().enumerate() {
-            let tc_col  = LAYER_COLORS_TC[li % LAYER_COLORS_TC.len()];
-            let a8_col  = LAYER_COLORS_ANSI[li % LAYER_COLORS_ANSI.len()];
+        for entry in self.layers.iter().filter(|e| e.visible) {
+            let tc_col  = LAYER_COLORS_TC[entry.color_index as usize % LAYER_COLORS_TC.len()];
+            let a8_col  = LAYER_COLORS_ANSI[entry.color_index as usize % LAYER_COLORS_ANSI.len()];
 
             let seg_fg = match self.capability {
                 TerminalCapability::TrueColor =>
@@ -308,7 +331,7 @@ impl<'a> Widget for MapView<'a> {
             let seg_style = Style::default().fg(seg_fg);
 
             // Line segments (LineString, MultiLineString, Polygon boundaries)
-            for ((lon0, lat0), (lon1, lat1)) in layer.segments() {
+            for ((lon0, lat0), (lon1, lat1)) in entry.layer.segments() {
                 if let (Some((c0, r0)), Some((c1, r1))) = (
                     latlon_to_screen(lat0, lon0, cmerc_x, cmerc_y,
                         cx_px, cy_px, mpp, mpp_y, cols, map_rows, use_hb),
@@ -331,7 +354,7 @@ impl<'a> Widget for MapView<'a> {
             } else {
                 RColor::Yellow
             };
-            for (lon, lat) in layer.all_point_coords() {
+            for (lon, lat) in entry.layer.all_point_coords() {
                 if let Some((sc, sr)) = latlon_to_screen(lat, lon, cmerc_x, cmerc_y,
                     cx_px, cy_px, mpp, mpp_y, cols, map_rows, use_hb)
                 {
@@ -359,10 +382,11 @@ impl<'a> Widget for MapView<'a> {
         } else {
             "  [M] mark · [I] import · [W/S] zoom · [↑↓←→] pan"
         };
+        let visible_count = self.layers.iter().filter(|e| e.visible).count();
         let layer_info = if self.layers.is_empty() {
             String::new()
         } else {
-            format!("  │  {} layer{}", self.layers.len(),
+            format!("  │  {}/{} layer{}", visible_count, self.layers.len(),
                 if self.layers.len() == 1 { "" } else { "s" })
         };
         let mpp     = self.resolution.metres_per_cpe(self.zoom);
