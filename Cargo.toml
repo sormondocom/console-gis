@@ -1,0 +1,27 @@
+[package]
+name           = "console-gis"
+version        = "0.1.0"
+edition        = "2021"
+rust-version   = "1.70"
+description    = "A geographic information system for the terminal"
+repository     = "https://github.com/YOUR_ORG/console-gis"
+license        = "MIT"
+keywords       = ["gis", "terminal", "tui", "geography", "maps"]
+categories     = ["visualization", "command-line-interface"]
+
+[[bin]]
+name = "console-gis"
+path = "src/main.rs"
+
+[lib]
+name = "console_gis"
+path = "src/lib.rs"
+
+[dependencies]
+crossterm  = "0.27"
+ratatui    = "0.28"
+anyhow     = "1"
+sled       = "0.34"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs-next  = "2"
