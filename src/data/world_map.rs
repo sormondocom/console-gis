@@ -107,18 +107,33 @@ const SOUTH_AMERICA_BBOX: BBox = BBox::new(-57.0, 13.0, -82.0, -34.0);
 
 /// Europe — mainland coast from Norway to Turkey, including Iberian and
 /// Italian peninsulas at console resolution.
+///
+/// The northern cap is at 70.5°N rather than the geographic maximum (~71.2°N
+/// at Nordkapp).  This avoids the even-odd "peak cancellation" problem: if
+/// both the west-coast edge and east-coast edge converge to the exact same
+/// vertex at 71°N, a horizontal test ray at any latitude below that vertex
+/// crosses both edges and gets double-cancelled (even = outside).  By capping
+/// at 70.5° the top is a short horizontal segment, giving one clean crossing
+/// per side for interior points in northern Norway and Sweden.
 const EUROPE: &[(f32, f32)] = &[
-    (71.0, 28.0),   (66.0, 14.0),   (62.0, 5.0),
+    // ── North cap (70.5°N horizontal, Russia/Norway → NW Norway) ─────────────
+    (70.5, 28.0),   (70.5, 15.0),
+    // ── Norwegian west coast (south) ─────────────────────────────────────────
+    (68.0, 13.0),   (66.0, 12.0),   (62.0, 5.0),
     (58.0, 5.0),    (56.0, 8.0),    (57.0, -3.0),
+    // ── British Isles / Atlantic coast ───────────────────────────────────────
     (54.0, -10.0),  (51.0, -10.0),  (51.0, 2.0),
     (46.0, -2.0),   (44.0, -9.0),   (36.0, -9.0),
+    // ── Iberia / Mediterranean ────────────────────────────────────────────────
     (36.0, -5.0),   (38.0, 0.0),    (40.0, 3.0),
     (38.0, 16.0),   (37.0, 24.0),   (37.0, 36.0),
+    // ── Black Sea / Eastern Europe ────────────────────────────────────────────
     (42.0, 36.0),   (42.0, 28.0),   (44.0, 30.0),
     (48.0, 38.0),   (54.0, 22.0),   (60.0, 26.0),
-    (66.0, 24.0),   (71.0, 28.0),
+    // ── Scandinavian east coast back to north cap ─────────────────────────────
+    (66.0, 24.0),   (70.5, 28.0),
 ];
-const EUROPE_BBOX: BBox = BBox::new(35.0, 72.0, -11.0, 42.0);
+const EUROPE_BBOX: BBox = BBox::new(35.0, 71.0, -11.0, 42.0);
 
 /// Africa — from Morocco south to Cape of Good Hope.
 const AFRICA: &[(f32, f32)] = &[
@@ -372,6 +387,15 @@ mod tests {
         assert!(wm.is_land(35.7, 139.7),  "Tokyo");
         assert!(wm.is_land(-25.0, 130.0), "Australian outback");
         assert!(wm.is_land(-80.0, 0.0),   "Antarctica");
+        // Scandinavia
+        assert!(wm.is_land(59.9, 10.7),   "Oslo");
+        assert!(wm.is_land(59.3, 18.1),   "Stockholm");
+        assert!(wm.is_land(57.7, 12.0),   "Gothenburg");
+        assert!(wm.is_land(60.4, 5.3),    "Bergen");
+        assert!(wm.is_land(63.4, 10.4),   "Trondheim");
+        assert!(wm.is_land(65.0, 18.0),   "N Sweden");
+        assert!(wm.is_land(55.7, 12.6),   "Copenhagen");
+        assert!(wm.is_land(60.2, 25.0),   "Helsinki");
     }
 
     #[test]
@@ -381,5 +405,42 @@ mod tests {
         assert!(!wm.is_land(0.0, 180.0),  "Pacific date line");
         assert!(!wm.is_land(30.0, -40.0), "N Atlantic");
         assert!(!wm.is_land(-40.0, -90.0),"S Pacific");
+    }
+
+    #[test]
+    fn scandinavia_grid() {
+        let wm = WorldMap::new();
+        // Grid points that are unambiguously inside the Scandinavian peninsula.
+        // Lon lower bound increases at higher latitudes because Norway narrows
+        // and the ocean (Norwegian Sea) extends further east at 66-70°N.
+        let cases: &[(f64, f64, &str)] = &[
+            // Southern Scandinavia / Denmark / Sweden / south Norway (reliable land)
+            (56.0, 10.0, "Denmark"),
+            (56.0, 14.0, "S Sweden"),
+            (58.0, 10.0, "SW Norway"),
+            (58.0, 14.0, "SE Norway / W Sweden"),
+            (60.0, 10.0, "Oslo area"),
+            (60.0, 16.0, "Central Sweden"),
+            (62.0, 10.0, "N of Trondheim"),
+            (62.0, 14.0, "Central Norway"),
+            // Northern Scandinavia — lon must be ≥ 14 to stay on land
+            (64.0, 14.0, "N Norway inner"),
+            (64.0, 17.0, "N Sweden"),
+            (66.0, 14.0, "Arctic Circle Norway"),
+            (66.0, 17.0, "N Sweden arctic"),
+            (68.0, 14.0, "N Norway (Bodø lat)"),
+            (68.0, 17.0, "N Norway inland"),
+            (70.0, 17.0, "Tromsø latitude"),
+            (70.0, 20.0, "N Norway interior"),
+        ];
+        let mut failures = vec![];
+        for &(lat, lon, label) in cases {
+            if !wm.is_land(lat, lon) {
+                failures.push(format!("  ({},{}) {} expected land", lat, lon, label));
+            }
+        }
+        if !failures.is_empty() {
+            panic!("Scandinavia grid failures:\n{}", failures.join("\n"));
+        }
     }
 }
