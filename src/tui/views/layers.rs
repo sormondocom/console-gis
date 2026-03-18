@@ -232,9 +232,9 @@ impl<'a> Widget for LayerManagerView<'a> {
         // ── Footer / key hints ────────────────────────────────────────────────
         let footer_row = area.y + area.height.saturating_sub(1);
         let hint = if uni {
-            "  ↑/↓ navigate  Space toggle  D delete  T topo  Esc back"
+            "  ↑/↓ navigate  Space toggle  D delete  I info  T topo  Esc back"
         } else {
-            "  Up/Dn navigate  Space toggle  D delete  T topo  Esc back"
+            "  Up/Dn navigate  Space toggle  D delete  I info  T topo  Esc back"
         };
         let hint_style = if tc {
             Style::default().fg(RColor::Rgb(70, 70, 90))

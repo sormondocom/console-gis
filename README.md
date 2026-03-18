@@ -875,11 +875,13 @@ console-gis/
 │   ├── main.rs                  # TUI entry point, event loop
 │   ├── geo/
 │   │   ├── coordinate.rs        # LatLon, BoundingBox, Haversine
-│   │   └── zoom.rs              # RenderMode, ConsoleResolution, CPE math
+│   │   ├── zoom.rs              # RenderMode, ConsoleResolution, CPE math
+│   │   └── calc.rs              # Geographic calculators (tiles, Mercator, DMS, bearing…)
 │   ├── data/
 │   │   ├── world_map.rs         # Land polygon data, point-in-polygon
+│   │   ├── topo.rs              # Built-in topographic elevation zones
 │   │   ├── markers.rs           # sled-backed marker store (blink, clear_all)
-│   │   └── geojson.rs           # GeoJSON parser (RFC 7946)
+│   │   └── geojson.rs           # GeoJSON parser (RFC 7946), layer splitting
 │   ├── render/
 │   │   ├── canvas.rs            # TerminalCapability, Canvas, DEC line-drawing
 │   │   ├── compat.rs            # Colour downshift tables
@@ -887,13 +889,15 @@ console-gis/
 │   │   ├── typography.rs        # Golden ratio layout, sfumato shading
 │   │   └── mod.rs               # detect_capability()
 │   └── tui/
-│       ├── app.rs               # App state, SavedState, Bookmark, MarkerInput
+│       ├── app.rs               # App state, SavedState, CalcState, CalcMode, MarkerInput
 │       └── views/
 │           ├── splash.rs        # Animated load screen
 │           ├── menu.rs          # GIS-domain interactive menu (GoldenLayout sidebar)
 │           ├── globe.rs         # 3D interactive globe widget + GeoJSON overlay
-│           ├── map.rs           # Flat Mercator map widget + GeoJSON overlay
+│           ├── map.rs           # Flat Mercator map widget + GeoJSON/topo overlay
 │           ├── markers.rs       # Scrollable marker list (GoldenLayout label col)
+│           ├── layers.rs        # Layer manager (GeoJSON + built-in topo toggle)
+│           ├── calc.rs          # Calculator view (9 geographic calculators)
 │           ├── zoom_explorer.rs # Zoom/resolution table view
 │           └── diagnostics.rs  # Terminal capability diagnostics
 ├── .github/
@@ -940,9 +944,20 @@ cargo test --lib
 
 **Minimum supported Rust version:** 1.70 (Rust 2021 edition)
 
-**Supported platforms:** Windows 10+ (via Windows Terminal or ConEmu), Linux (xterm, Alacritty,
-Kitty, GNOME Terminal, any xterm-compatible), macOS (Terminal.app, iTerm2), and any hardware
-terminal that speaks DEC VT-100 (serial port, SSH).
+**Confirmed supported platforms:**
+
+| Platform                     | Notes                                             |
+|:-----------------------------|:--------------------------------------------------|
+| **Windows 10**               | Windows Terminal (TrueColor), ConEmu              |
+| **Linux**                    | xterm, Alacritty, Kitty, GNOME Terminal, any xterm-compatible |
+| **macOS**                    | Terminal.app, iTerm2                              |
+| **Android / Termux**         | Confirmed working — compiles and renders on ARM via `cargo build` in Termux |
+| **OpenBSD**                  | Latest stable release                             |
+| **DEC VT-100 hardware**      | Serial port or SSH — VT-100 ASCII mode            |
+
+The entire dependency tree is pure Rust with no C compilation required, which is the primary
+reason cross-compilation to unusual targets (Android, OpenBSD) works without system library
+headaches.
 
 ### Continuous Integration
 

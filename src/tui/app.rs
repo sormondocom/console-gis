@@ -220,6 +220,18 @@ pub struct App {
     /// Text buffer for the bookmark name being typed.
     pub bookmark_buf:     String,
 
+    // ── Calculator ────────────────────────────────────────────────────────────
+    /// Calculator view state.
+    pub calc: CalcState,
+
+    // ── Shape editor ──────────────────────────────────────────────────────────
+    /// Interactive shape builder and GeoJSON exporter.
+    pub shape_editor: ShapeEditorState,
+
+    // ── Layer info overlay ────────────────────────────────────────────────────
+    /// When true, show the GeoJSON breakdown overlay in the Layers view.
+    pub layer_info: bool,
+
     // ── Session persistence ───────────────────────────────────────────────────
     /// Path to the saved-state JSON file.
     pub state_path:     PathBuf,
@@ -270,6 +282,9 @@ impl App {
             clearing_markers: false,
             bookmarking:      false,
             bookmark_buf:     String::new(),
+            calc:             CalcState::new(),
+            shape_editor:     ShapeEditorState::new(),
+            layer_info:       false,
             state_path,
         }
     }
@@ -569,4 +584,661 @@ pub enum View {
     ZoomExplorer,
     Diagnostics,
     Layers,
+    Calculator,
+    ShapeEditor,
+}
+
+// ── Shape editor state ─────────────────────────────────────────────────────────
+
+/// Geometry type being constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeType {
+    Point,
+    MultiPoint,
+    LineString,
+    MultiLineString,
+    Polygon,
+    MultiPolygon,
+}
+
+impl ShapeType {
+    pub const ALL: &'static [ShapeType] = &[
+        ShapeType::Point,
+        ShapeType::MultiPoint,
+        ShapeType::LineString,
+        ShapeType::MultiLineString,
+        ShapeType::Polygon,
+        ShapeType::MultiPolygon,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ShapeType::Point           => "Point",
+            ShapeType::MultiPoint      => "MultiPoint",
+            ShapeType::LineString      => "LineString",
+            ShapeType::MultiLineString => "MultiLineString",
+            ShapeType::Polygon         => "Polygon",
+            ShapeType::MultiPolygon    => "MultiPolygon",
+        }
+    }
+
+    pub fn key(self) -> char {
+        match self {
+            ShapeType::Point           => '1',
+            ShapeType::MultiPoint      => '2',
+            ShapeType::LineString      => '3',
+            ShapeType::MultiLineString => '4',
+            ShapeType::Polygon         => '5',
+            ShapeType::MultiPolygon    => '6',
+        }
+    }
+
+    /// Minimum coordinates required to form a valid geometry.
+    pub fn min_coords_per_part(self) -> usize {
+        match self {
+            ShapeType::Point | ShapeType::MultiPoint  => 1,
+            ShapeType::LineString | ShapeType::MultiLineString => 2,
+            ShapeType::Polygon | ShapeType::MultiPolygon       => 3,
+        }
+    }
+
+    /// Whether the type supports multiple parts (F to finish part).
+    pub fn is_multi(self) -> bool {
+        matches!(self,
+            ShapeType::MultiPoint | ShapeType::MultiLineString | ShapeType::MultiPolygon)
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            ShapeType::Point           => "Enter one coordinate, then N to continue.",
+            ShapeType::MultiPoint      => "Add points. F=finish adding · N=next step",
+            ShapeType::LineString      => "Add ≥2 coords for the line. N=next step",
+            ShapeType::MultiLineString => "Add coords. F=finish line · N=done adding lines",
+            ShapeType::Polygon         => "Add ≥3 coords for the ring. N=next step",
+            ShapeType::MultiPolygon    => "Add coords. F=finish polygon · N=done",
+        }
+    }
+}
+
+/// Which step the shape editor is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeEditorStep {
+    SelectType,
+    AddVertices,
+    EnterName,
+    EnterExportPath,
+}
+
+/// All mutable state for the interactive shape editor.
+pub struct ShapeEditorState {
+    pub step:        ShapeEditorStep,
+    pub type_idx:    usize,
+    // ── Coordinate input ──────────────────────────────────────────────────────
+    pub lat_buf:     String,
+    pub lon_buf:     String,
+    /// 0 = lat field focused, 1 = lon field focused.
+    pub coord_field: usize,
+    // ── Accumulated geometry ──────────────────────────────────────────────────
+    /// Finalized parts (for multi-geometries each F press appends one here).
+    pub parts:       Vec<Vec<(f64, f64)>>,
+    /// Current part still being edited.
+    pub current:     Vec<(f64, f64)>,
+    /// Scroll offset for the vertex list display.
+    pub vert_scroll: usize,
+    // ── Name / export ─────────────────────────────────────────────────────────
+    pub name_buf:    String,
+    pub export_buf:  String,
+    /// Feedback from the last export attempt.
+    pub message:     Option<String>,
+}
+
+impl ShapeEditorState {
+    pub fn new() -> Self {
+        Self {
+            step:        ShapeEditorStep::SelectType,
+            type_idx:    0,
+            lat_buf:     String::new(),
+            lon_buf:     String::new(),
+            coord_field: 0,
+            parts:       Vec::new(),
+            current:     Vec::new(),
+            vert_scroll: 0,
+            name_buf:    String::new(),
+            export_buf:  String::new(),
+            message:     None,
+        }
+    }
+
+    pub fn current_type(&self) -> ShapeType { ShapeType::ALL[self.type_idx] }
+
+    /// Reset to a fresh state for re-use.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Total accumulated coordinate count across all parts + current.
+    pub fn total_coords(&self) -> usize {
+        self.parts.iter().map(|p| p.len()).sum::<usize>() + self.current.len()
+    }
+
+    /// Try to parse lat/lon bufs and add a vertex to `current`.
+    /// Returns an error string on parse failure.
+    pub fn commit_vertex(&mut self) -> Result<(), String> {
+        let lat = self.lat_buf.trim().parse::<f64>()
+            .map_err(|_| format!("Invalid lat: \"{}\"", self.lat_buf))?;
+        let lon = self.lon_buf.trim().parse::<f64>()
+            .map_err(|_| format!("Invalid lon: \"{}\"", self.lon_buf))?;
+        if !(-90.0..=90.0).contains(&lat) {
+            return Err(format!("Latitude {lat} out of range −90…90"));
+        }
+        if !(-180.0..=180.0).contains(&lon) {
+            return Err(format!("Longitude {lon} out of range −180…180"));
+        }
+        self.current.push((lat, lon));
+        self.lat_buf.clear();
+        self.lon_buf.clear();
+        self.coord_field = 0;
+        self.message = None;
+        // Auto-scroll vertex list to bottom
+        self.vert_scroll = self.total_coords().saturating_sub(1);
+        Ok(())
+    }
+
+    /// Finish the current part and start a new one (multi-geometry types only).
+    pub fn finish_part(&mut self) -> Result<(), String> {
+        let min = self.current_type().min_coords_per_part();
+        if self.current.len() < min {
+            return Err(format!(
+                "Need ≥{min} coordinate{} to finish a {}.",
+                if min == 1 { "" } else { "s" },
+                self.current_type().name(),
+            ));
+        }
+        self.parts.push(std::mem::take(&mut self.current));
+        self.message = None;
+        Ok(())
+    }
+
+    /// Remove the last coordinate (from `current`, or from the last part).
+    pub fn undo_vertex(&mut self) {
+        if self.current.pop().is_none() {
+            if let Some(last) = self.parts.last_mut() {
+                last.pop();
+                if last.is_empty() { self.parts.pop(); }
+            }
+        }
+        self.vert_scroll = self.total_coords().saturating_sub(1);
+        self.message = None;
+    }
+
+    /// All coords in display order: finalized parts + current.
+    pub fn all_coords(&self) -> Vec<(f64, f64)> {
+        let mut v = Vec::with_capacity(self.total_coords());
+        for p in &self.parts { v.extend_from_slice(p); }
+        v.extend_from_slice(&self.current);
+        v
+    }
+
+    /// Validate and serialize to a GeoJSON FeatureCollection string.
+    pub fn to_geojson(&self) -> Result<String, String> {
+        let geom = self.build_geometry()?;
+        let name = self.name_buf.trim();
+        let fc = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": geom,
+                "properties": if name.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!({ "name": name })
+                }
+            }]
+        });
+        serde_json::to_string_pretty(&fc).map_err(|e| e.to_string())
+    }
+
+    /// Write GeoJSON to `self.export_buf` path.
+    pub fn export(&mut self) {
+        let path = self.export_buf.trim().to_string();
+        if path.is_empty() {
+            self.message = Some("Enter a file path first.".into());
+            return;
+        }
+        match self.to_geojson() {
+            Err(e) => { self.message = Some(format!("Build error: {e}")); }
+            Ok(json) => {
+                match std::fs::write(&path, &json) {
+                    Ok(_) => {
+                        self.message = Some(format!(
+                            "Saved {} bytes → {path}",
+                            json.len()
+                        ));
+                    }
+                    Err(e) => { self.message = Some(format!("Write error: {e}")); }
+                }
+            }
+        }
+    }
+
+    fn build_geometry(&self) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        // Merge finalized parts + any remaining current
+        let mut all_parts = self.parts.clone();
+        if !self.current.is_empty() {
+            all_parts.push(self.current.clone());
+        }
+
+        fn coord_to_json(lat: f64, lon: f64) -> serde_json::Value {
+            json!([lon, lat])   // GeoJSON is [lon, lat]
+        }
+        fn ring_to_json(pts: &[(f64, f64)]) -> serde_json::Value {
+            let mut v: Vec<_> = pts.iter().map(|(la, lo)| coord_to_json(*la, *lo)).collect();
+            // Close polygon ring if needed
+            if let (Some(first), Some(last)) = (pts.first(), pts.last()) {
+                if first != last { v.push(coord_to_json(first.0, first.1)); }
+            }
+            json!(v)
+        }
+
+        let min = self.current_type().min_coords_per_part();
+        let total: usize = all_parts.iter().map(|p| p.len()).sum();
+        if total < min {
+            return Err(format!(
+                "Need ≥{min} coordinate{} for {}.",
+                if min == 1 { "" } else { "s" },
+                self.current_type().name(),
+            ));
+        }
+
+        let geom = match self.current_type() {
+            ShapeType::Point => {
+                let (la, lo) = all_parts[0][0];
+                json!({ "type": "Point", "coordinates": coord_to_json(la, lo) })
+            }
+            ShapeType::MultiPoint => {
+                let coords: Vec<_> = all_parts.iter()
+                    .flat_map(|p| p.iter())
+                    .map(|(la, lo)| coord_to_json(*la, *lo))
+                    .collect();
+                json!({ "type": "MultiPoint", "coordinates": coords })
+            }
+            ShapeType::LineString => {
+                let coords: Vec<_> = all_parts.iter()
+                    .flat_map(|p| p.iter())
+                    .map(|(la, lo)| coord_to_json(*la, *lo))
+                    .collect();
+                json!({ "type": "LineString", "coordinates": coords })
+            }
+            ShapeType::MultiLineString => {
+                let lines: Vec<_> = all_parts.iter()
+                    .filter(|p| p.len() >= 2)
+                    .map(|p| {
+                        let coords: Vec<_> = p.iter().map(|(la, lo)| coord_to_json(*la, *lo)).collect();
+                        json!(coords)
+                    })
+                    .collect();
+                if lines.is_empty() { return Err("Need ≥1 finished line with ≥2 points.".into()); }
+                json!({ "type": "MultiLineString", "coordinates": lines })
+            }
+            ShapeType::Polygon => {
+                // First part = outer ring; additional parts = holes (not yet supported in UI but structurally correct)
+                let rings: Vec<_> = all_parts.iter()
+                    .filter(|p| p.len() >= 3)
+                    .map(|p| ring_to_json(p))
+                    .collect();
+                if rings.is_empty() { return Err("Need ≥3 coordinates for a polygon ring.".into()); }
+                json!({ "type": "Polygon", "coordinates": rings })
+            }
+            ShapeType::MultiPolygon => {
+                let polys: Vec<_> = all_parts.iter()
+                    .filter(|p| p.len() >= 3)
+                    .map(|p| json!([ring_to_json(p)]))
+                    .collect();
+                if polys.is_empty() { return Err("Need ≥1 polygon with ≥3 coordinates.".into()); }
+                json!({ "type": "MultiPolygon", "coordinates": polys })
+            }
+        };
+        Ok(geom)
+    }
+}
+
+// ── Calculator state ───────────────────────────────────────────────────────────
+
+/// The nine built-in calculators, in menu order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalcMode {
+    LatLonToTile,
+    TileToLatLon,
+    Wgs84ToMercator,
+    MercatorToWgs84,
+    DdToDms,
+    DmsToDD,
+    Distance,
+    Bearing,
+    DestinationPoint,
+}
+
+impl CalcMode {
+    pub const ALL: &'static [CalcMode] = &[
+        CalcMode::LatLonToTile,
+        CalcMode::TileToLatLon,
+        CalcMode::Wgs84ToMercator,
+        CalcMode::MercatorToWgs84,
+        CalcMode::DdToDms,
+        CalcMode::DmsToDD,
+        CalcMode::Distance,
+        CalcMode::Bearing,
+        CalcMode::DestinationPoint,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CalcMode::LatLonToTile     => "Lat/Lon → Slippy Tile",
+            CalcMode::TileToLatLon     => "Slippy Tile → Lat/Lon",
+            CalcMode::Wgs84ToMercator  => "WGS-84 → Web Mercator",
+            CalcMode::MercatorToWgs84  => "Web Mercator → WGS-84",
+            CalcMode::DdToDms          => "DD → DMS / DDM",
+            CalcMode::DmsToDD          => "DMS → Decimal Degrees",
+            CalcMode::Distance         => "Haversine Distance",
+            CalcMode::Bearing          => "Bearing",
+            CalcMode::DestinationPoint => "Destination Point",
+        }
+    }
+
+    pub fn key(self) -> char {
+        match self {
+            CalcMode::LatLonToTile     => '1',
+            CalcMode::TileToLatLon     => '2',
+            CalcMode::Wgs84ToMercator  => '3',
+            CalcMode::MercatorToWgs84  => '4',
+            CalcMode::DdToDms          => '5',
+            CalcMode::DmsToDD          => '6',
+            CalcMode::Distance         => '7',
+            CalcMode::Bearing          => '8',
+            CalcMode::DestinationPoint => '9',
+        }
+    }
+
+    pub fn field_labels(self) -> &'static [&'static str] {
+        match self {
+            CalcMode::LatLonToTile     => &["Latitude", "Longitude", "Zoom (0-20)"],
+            CalcMode::TileToLatLon     => &["Tile X", "Tile Y", "Zoom (0-20)"],
+            CalcMode::Wgs84ToMercator  => &["Latitude", "Longitude"],
+            CalcMode::MercatorToWgs84  => &["X (metres)", "Y (metres)"],
+            CalcMode::DdToDms          => &["Latitude (DD)", "Longitude (DD)"],
+            CalcMode::DmsToDD          => &["Lat deg", "Lat min", "Lat sec", "N or S",
+                                            "Lon deg", "Lon min", "Lon sec", "E or W"],
+            CalcMode::Distance         => &["Lat 1", "Lon 1", "Lat 2", "Lon 2"],
+            CalcMode::Bearing          => &["Lat 1", "Lon 1", "Lat 2", "Lon 2"],
+            CalcMode::DestinationPoint => &["Latitude", "Longitude", "Bearing (°)", "Distance (m)"],
+        }
+    }
+}
+
+/// Computed result from a calculator.
+pub struct CalcResult {
+    /// Lines of formatted output.
+    pub lines: Vec<String>,
+    /// Geographic point embedded in the result (enables place/go-to actions).
+    pub latlon: Option<(f64, f64)>,
+}
+
+/// Mutable state for the calculator view.
+pub struct CalcState {
+    /// Index into `CalcMode::ALL` for the currently selected calculator.
+    pub mode_idx:    usize,
+    /// Per-field text buffers.
+    pub fields:      Vec<String>,
+    /// Which field index has focus (when `focus_right` is true).
+    pub field_idx:   usize,
+    /// If true the right panel (inputs) has keyboard focus; left panel otherwise.
+    pub focus_right: bool,
+    /// Most recent successful result.
+    pub result:      Option<CalcResult>,
+    /// Error message from the last failed compute.
+    pub error:       Option<String>,
+}
+
+impl CalcState {
+    pub fn new() -> Self {
+        let mut s = Self {
+            mode_idx:    0,
+            fields:      Vec::new(),
+            field_idx:   0,
+            focus_right: false,
+            result:      None,
+            error:       None,
+        };
+        s.reset_fields();
+        s
+    }
+
+    pub fn current_mode(&self) -> CalcMode {
+        CalcMode::ALL[self.mode_idx]
+    }
+
+    pub fn set_mode(&mut self, idx: usize) {
+        if idx < CalcMode::ALL.len() {
+            self.mode_idx = idx;
+            self.reset_fields();
+        }
+    }
+
+    fn reset_fields(&mut self) {
+        let n = self.current_mode().field_labels().len();
+        self.fields   = vec![String::new(); n];
+        self.field_idx = 0;
+        self.result    = None;
+        self.error     = None;
+    }
+
+    fn pf(s: &str) -> Option<f64>  { s.trim().parse().ok() }
+    fn pu(s: &str) -> Option<u32>  { s.trim().parse().ok() }
+    fn p8(s: &str) -> Option<u8>   { s.trim().parse().ok() }
+
+    /// Parse hemisphere letter: 'N'/'E' → false (positive), 'S'/'W' → true (negative).
+    fn hem(s: &str) -> Option<bool> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "N" | "E" => Some(false),
+            "S" | "W" => Some(true),
+            _          => None,
+        }
+    }
+
+    /// Run the selected calculator against the current field values.
+    pub fn compute(&mut self) {
+        use crate::geo::calc::*;
+        self.error  = None;
+        self.result = None;
+        let f = self.fields.clone();
+
+        match self.current_mode() {
+            CalcMode::LatLonToTile => {
+                match (Self::pf(&f[0]), Self::pf(&f[1]), Self::p8(&f[2])) {
+                    (Some(lat), Some(lon), Some(z)) if z <= 20 => {
+                        let (tx, ty) = latlon_to_tile(lat, lon, z);
+                        let (s, w, n, e) = tile_bbox(tx, ty, z);
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("Tile X / Y:  {tx} / {ty}"),
+                                format!("URL path:    {z}/{tx}/{ty}"),
+                                String::new(),
+                                format!("Bbox N: {n:.6}°   S: {s:.6}°"),
+                                format!("Bbox E: {e:.6}°   W: {w:.6}°"),
+                            ],
+                            latlon: Some((lat, lon)),
+                        });
+                    }
+                    _ => self.error = Some("Need valid lat, lon, and zoom 0–20.".into()),
+                }
+            }
+
+            CalcMode::TileToLatLon => {
+                match (Self::pu(&f[0]), Self::pu(&f[1]), Self::p8(&f[2])) {
+                    (Some(tx), Some(ty), Some(z)) if z <= 20 => {
+                        let (north, west) = tile_to_latlon_nw(tx, ty, z);
+                        let (south, east) = tile_to_latlon_nw(tx + 1, ty + 1, z);
+                        let clat = (north + south) / 2.0;
+                        let clon = (west  + east)  / 2.0;
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("NW:     {north:.6}°N  {:.6}°{}", west.abs(), if west >= 0.0 { 'E' } else { 'W' }),
+                                format!("SE:     {:.6}°{}  {:.6}°{}", south.abs(), if south >= 0.0 { 'N' } else { 'S' }, east.abs(), if east >= 0.0 { 'E' } else { 'W' }),
+                                format!("Center: {:.6}°{}  {:.6}°{}", clat.abs(), if clat >= 0.0 { 'N' } else { 'S' }, clon.abs(), if clon >= 0.0 { 'E' } else { 'W' }),
+                                String::new(),
+                                format!("Bbox:   {south:.6}, {west:.6}, {north:.6}, {east:.6}"),
+                            ],
+                            latlon: Some((clat, clon)),
+                        });
+                    }
+                    _ => self.error = Some("Need valid tile X, Y, and zoom 0–20.".into()),
+                }
+            }
+
+            CalcMode::Wgs84ToMercator => {
+                match (Self::pf(&f[0]), Self::pf(&f[1])) {
+                    (Some(lat), Some(lon)) => {
+                        let (xm, ym) = wgs84_to_mercator(lat, lon);
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("X (Easting):  {xm:.3} m"),
+                                format!("Y (Northing): {ym:.3} m"),
+                                String::new(),
+                                format!("EPSG:3857  ({xm:.1}, {ym:.1})"),
+                            ],
+                            latlon: Some((lat, lon)),
+                        });
+                    }
+                    _ => self.error = Some("Need valid decimal lat and lon.".into()),
+                }
+            }
+
+            CalcMode::MercatorToWgs84 => {
+                match (Self::pf(&f[0]), Self::pf(&f[1])) {
+                    (Some(xm), Some(ym)) => {
+                        let (lat, lon) = mercator_to_wgs84(xm, ym);
+                        let (ld, lm, ls, ldir) = dd_to_dms(lat, true);
+                        let (od, om, os, odir) = dd_to_dms(lon, false);
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("Latitude:  {lat:.8}°"),
+                                format!("Longitude: {lon:.8}°"),
+                                String::new(),
+                                format!("DMS: {}°{:02}'{:06.3}\"{}  {}°{:02}'{:06.3}\"{}",
+                                    ld, lm, ls, ldir, od, om, os, odir),
+                            ],
+                            latlon: Some((lat, lon)),
+                        });
+                    }
+                    _ => self.error = Some("Need valid X and Y in metres.".into()),
+                }
+            }
+
+            CalcMode::DdToDms => {
+                match (Self::pf(&f[0]), Self::pf(&f[1])) {
+                    (Some(lat), Some(lon)) => {
+                        let (ld, lm, ls, ldir) = dd_to_dms(lat, true);
+                        let (od, om, os, odir) = dd_to_dms(lon, false);
+                        let (ld2, ldm, ldir2)  = dd_to_ddm(lat, true);
+                        let (od2, odm, odir2)  = dd_to_ddm(lon, false);
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("DMS Lat:  {}°{:02}'{:06.3}\"{}",  ld,  lm,  ls,  ldir),
+                                format!("DMS Lon:  {}°{:02}'{:06.3}\"{}",  od,  om,  os,  odir),
+                                String::new(),
+                                format!("DDM Lat:  {}°{:09.6}′{}", ld2, ldm, ldir2),
+                                format!("DDM Lon:  {}°{:09.6}′{}", od2, odm, odir2),
+                            ],
+                            latlon: Some((lat, lon)),
+                        });
+                    }
+                    _ => self.error = Some("Enter decimal degrees for lat and lon.".into()),
+                }
+            }
+
+            CalcMode::DmsToDD => {
+                let (lat_d, lat_m, lat_s, lat_h) =
+                    (Self::pf(&f[0]), Self::pf(&f[1]), Self::pf(&f[2]), Self::hem(&f[3]));
+                let (lon_d, lon_m, lon_s, lon_h) =
+                    (Self::pf(&f[4]), Self::pf(&f[5]), Self::pf(&f[6]), Self::hem(&f[7]));
+                match (lat_d, lat_m, lat_s, lat_h, lon_d, lon_m, lon_s, lon_h) {
+                    (Some(ld), Some(lm), Some(ls), Some(ln),
+                     Some(od), Some(om), Some(os), Some(on)) => {
+                        let lat = dms_to_dd(ld, lm, ls, ln);
+                        let lon = dms_to_dd(od, om, os, on);
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("Latitude:  {lat:.8}°"),
+                                format!("Longitude: {lon:.8}°"),
+                                String::new(),
+                                format!("WGS-84: {lat:.6}, {lon:.6}"),
+                            ],
+                            latlon: Some((lat, lon)),
+                        });
+                    }
+                    _ => self.error = Some("Fill D M S and hemisphere (N/S or E/W) for both.".into()),
+                }
+            }
+
+            CalcMode::Distance => {
+                match (Self::pf(&f[0]), Self::pf(&f[1]), Self::pf(&f[2]), Self::pf(&f[3])) {
+                    (Some(la1), Some(lo1), Some(la2), Some(lo2)) => {
+                        let m  = haversine_m(la1, lo1, la2, lo2);
+                        let km = m / 1_000.0;
+                        let mi = m / 1_609.344;
+                        let nm = m / 1_852.0;
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("Distance: {m:.1} m"),
+                                format!("          {km:.3} km"),
+                                format!("          {mi:.3} mi"),
+                                format!("          {nm:.3} NM"),
+                            ],
+                            latlon: None,
+                        });
+                    }
+                    _ => self.error = Some("Need four decimal-degree values.".into()),
+                }
+            }
+
+            CalcMode::Bearing => {
+                match (Self::pf(&f[0]), Self::pf(&f[1]), Self::pf(&f[2]), Self::pf(&f[3])) {
+                    (Some(la1), Some(lo1), Some(la2), Some(lo2)) => {
+                        let fwd = bearing_deg(la1, lo1, la2, lo2);
+                        let rev = (fwd + 180.0) % 360.0;
+                        let dir = compass_dir(fwd);
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("Forward: {fwd:.2}°  ({dir})"),
+                                format!("Reverse: {rev:.2}°  ({})", compass_dir(rev)),
+                            ],
+                            latlon: None,
+                        });
+                    }
+                    _ => self.error = Some("Need four decimal-degree values.".into()),
+                }
+            }
+
+            CalcMode::DestinationPoint => {
+                match (Self::pf(&f[0]), Self::pf(&f[1]), Self::pf(&f[2]), Self::pf(&f[3])) {
+                    (Some(lat), Some(lon), Some(brng), Some(dist)) => {
+                        let (lat2, lon2) = destination_point(lat, lon, brng, dist);
+                        let (ld, lm, ls, ldir) = dd_to_dms(lat2, true);
+                        let (od, om, os, odir) = dd_to_dms(lon2, false);
+                        self.result = Some(CalcResult {
+                            lines: vec![
+                                format!("Destination: {lat2:.8}°, {lon2:.8}°"),
+                                String::new(),
+                                format!("DMS: {}°{:02}'{:06.3}\"{}  {}°{:02}'{:06.3}\"{}",
+                                    ld, lm, ls, ldir, od, om, os, odir),
+                            ],
+                            latlon: Some((lat2, lon2)),
+                        });
+                    }
+                    _ => self.error = Some("Need lat, lon, bearing (°), distance (m).".into()),
+                }
+            }
+        }
+    }
 }

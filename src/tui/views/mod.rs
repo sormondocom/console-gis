@@ -6,3 +6,5 @@ pub mod markers;
 pub mod zoom_explorer;
 pub mod diagnostics;
 pub mod layers;
+pub mod calc;
+pub mod shape_editor;

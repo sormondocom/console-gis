@@ -52,6 +52,20 @@ pub const MENU_ITEMS: &[MenuItem] = &[
         icon:  "≋",
         desc:  "Manage imported GeoJSON layers — toggle visibility, delete, view details.\n\nControls: ↑↓ navigate · Space toggle visibility · D delete · Esc back",
     },
+    MenuItem {
+        key:   '7',
+        label: "Calculator",
+        view:  View::Calculator,
+        icon:  "⊞",
+        desc:  "Geographic calculators: slippy tile XY, Web Mercator (EPSG:3857), DMS/DDM conversions, haversine distance, bearing, destination point.\n\nAfter computing, press P to place the result as a marker, G to jump to the globe, or M to jump to the map.",
+    },
+    MenuItem {
+        key:   '8',
+        label: "Shape Editor",
+        view:  View::ShapeEditor,
+        icon:  "◈",
+        desc:  "Interactively define Point, MultiPoint, LineString, MultiLineString, Polygon, or MultiPolygon geometries by entering coordinates one at a time.\n\nExports a valid GeoJSON FeatureCollection that can be re-imported as a layer.\n\nControls: ↑↓/1-6 pick type · Enter start · Tab switch lat/lon · Enter add coord · F finish part · U undo · N next step",
+    },
 ];
 
 pub struct MenuItem {

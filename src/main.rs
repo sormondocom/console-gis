@@ -16,7 +16,7 @@ use console_gis::{
     data::{Marker, MarkerStore},
     render::{detect_capability, canvas::TerminalCapability},
     tui::{
-        app::{App, MarkerInput, MarkerInputStep, SavedState, View},
+        app::{App, CalcMode, MarkerInput, MarkerInputStep, SavedState, ShapeEditorStep, ShapeType, View},
         views::{
             splash::SplashWidget,
             menu::{MenuWidget, MENU_ITEMS},
@@ -26,6 +26,8 @@ use console_gis::{
             zoom_explorer::ZoomExplorerView,
             diagnostics::DiagnosticsView,
             layers::LayerManagerView,
+            calc::CalcView,
+            shape_editor::ShapeEditorView,
         },
     },
 };
@@ -181,6 +183,24 @@ fn run_app(
                             selected:     app.layer_list_sel,
                             capability,
                             topo_enabled: app.topo_enabled,
+                        },
+                        area,
+                    );
+                }
+                View::Calculator => {
+                    f.render_widget(
+                        CalcView {
+                            state:      &app.calc,
+                            capability,
+                        },
+                        area,
+                    );
+                }
+                View::ShapeEditor => {
+                    f.render_widget(
+                        ShapeEditorView {
+                            state:      &app.shape_editor,
+                            capability,
                         },
                         area,
                     );
@@ -355,6 +375,144 @@ fn run_app(
                 }
             }
 
+            // ── Layer info overlay (Layers view, I key) ───────────────────────
+            if app.layer_info {
+                let buf  = f.buffer_mut();
+                let tc   = capability.supports_true_colour();
+                let bg   = if tc { Color::Rgb(8, 10, 28)    } else { Color::DarkGray };
+                let fg   = if tc { Color::Rgb(30, 200, 240)  } else { Color::Cyan };
+                let val  = if tc { Color::Rgb(200, 220, 255) } else { Color::White };
+                let dim  = if tc { Color::Rgb(70, 80, 110)   } else { Color::DarkGray };
+                let ok   = if tc { Color::Rgb(80, 220, 100)  } else { Color::Green };
+
+                // Show over the bottom half of the screen
+                let panel_h = (rows / 2).max(12);
+                let oy = rows.saturating_sub(panel_h);
+
+                // Background fill
+                for r in oy..rows {
+                    for c in 0..cols {
+                        buf.get_mut(c, r).set_char(' ').set_bg(bg).set_fg(fg);
+                    }
+                }
+
+                // Title bar
+                let title = " GeoJSON Layer Info  (Esc to close) ";
+                for (ci, ch) in title.chars().enumerate() {
+                    let c = ci as u16;
+                    if c >= cols { break; }
+                    buf.get_mut(c, oy)
+                       .set_char(ch)
+                       .set_fg(fg)
+                       .set_bg(bg)
+                       .set_style(ratatui::style::Style::default()
+                           .add_modifier(ratatui::style::Modifier::BOLD));
+                }
+
+                // Determine selected layer (index 0 = topo, 1..=N = geo)
+                if app.layer_list_sel > 0 {
+                    if let Some(entry) = app.geo_layers.get(app.layer_list_sel - 1) {
+                        let layer = &entry.layer;
+
+                        // Counts per geometry type
+                        let mut n_pt = 0usize; let mut n_mpt = 0usize;
+                        let mut n_ls = 0usize; let mut n_mls = 0usize;
+                        let mut n_pg = 0usize; let mut n_mpg = 0usize;
+                        let mut n_col = 0usize;
+                        let mut min_lat = f64::MAX; let mut max_lat = f64::MIN;
+                        let mut min_lon = f64::MAX; let mut max_lon = f64::MIN;
+                        let mut prop_keys: Vec<String> = Vec::new();
+
+                        use console_gis::data::geojson::GeoGeometry;
+                        for feat in &layer.features {
+                            match &feat.geometry {
+                                GeoGeometry::Point(_)           => n_pt  += 1,
+                                GeoGeometry::MultiPoint(_)      => n_mpt += 1,
+                                GeoGeometry::LineString(_)      => n_ls  += 1,
+                                GeoGeometry::MultiLineString(_) => n_mls += 1,
+                                GeoGeometry::Polygon(_)         => n_pg  += 1,
+                                GeoGeometry::MultiPolygon(_)    => n_mpg += 1,
+                                GeoGeometry::Collection(_)      => n_col += 1,
+                            }
+                            for (lon, lat) in layer.all_point_coords() {
+                                if lat < min_lat { min_lat = lat; }
+                                if lat > max_lat { max_lat = lat; }
+                                if lon < min_lon { min_lon = lon; }
+                                if lon > max_lon { max_lon = lon; }
+                            }
+                            for k in feat.properties.keys() {
+                                if !prop_keys.contains(k) { prop_keys.push(k.clone()); }
+                            }
+                        }
+
+                        let lines: Vec<String> = vec![
+                            format!("  File:      {}", entry.label),
+                            format!("  Path:      {}", &layer.source[..layer.source.len().min(cols as usize - 12)]),
+                            format!("  Features:  {}", layer.features.len()),
+                            String::new(),
+                            format!("  Geometry breakdown:"),
+                            format!("    Point          : {n_pt}"),
+                            format!("    MultiPoint     : {n_mpt}"),
+                            format!("    LineString     : {n_ls}"),
+                            format!("    MultiLineString: {n_mls}"),
+                            format!("    Polygon        : {n_pg}"),
+                            format!("    MultiPolygon   : {n_mpg}"),
+                            format!("    Collection     : {n_col}"),
+                            String::new(),
+                            if min_lat <= max_lat {
+                                format!("  Bbox:      {min_lat:.4}°N  {min_lon:.4}°E  →  {max_lat:.4}°N  {max_lon:.4}°E")
+                            } else {
+                                "  Bbox:      (no coordinates)".to_string()
+                            },
+                            String::new(),
+                            format!("  Properties:  {}", if prop_keys.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                prop_keys.join(", ")
+                            }),
+                        ];
+
+                        for (li, line) in lines.iter().enumerate() {
+                            let r = oy + 1 + li as u16;
+                            if r >= rows { break; }
+                            let lc = if line.trim().is_empty() { dim }
+                                     else if line.starts_with("    ") { val }
+                                     else { ok };
+                            for (ci, ch) in line.chars().enumerate() {
+                                let c = ci as u16;
+                                if c >= cols { break; }
+                                buf.get_mut(c, r).set_char(ch).set_fg(lc).set_bg(bg);
+                            }
+                        }
+                    } else {
+                        let msg = "  No layer selected.";
+                        for (ci, ch) in msg.chars().enumerate() {
+                            buf.get_mut(ci as u16, oy + 1).set_char(ch).set_fg(dim).set_bg(bg);
+                        }
+                    }
+                } else {
+                    // Built-in topo selected
+                    let lines = [
+                        "  Built-in Topographic Elevation Layer",
+                        "  Source:  compiled into the binary (constant polygons)",
+                        "  Zones:   15 elevation polygons across 4 tiers",
+                        "    Tier 0  Ocean / lowlands (default)",
+                        "    Tier 1  Appalachians, Brazilian Highlands, Deccan, Siberia…",
+                        "    Tier 2  Rockies, Andes, Alps, Caucasus, Zagros, Atlas…",
+                        "    Tier 3  Tibetan Plateau, High Andes (>4000 m)",
+                    ];
+                    for (li, line) in lines.iter().enumerate() {
+                        let r = oy + 1 + li as u16;
+                        if r >= rows { break; }
+                        for (ci, ch) in line.chars().enumerate() {
+                            let c = ci as u16;
+                            if c >= cols { break; }
+                            buf.get_mut(c, r).set_char(ch).set_fg(ok).set_bg(bg);
+                        }
+                    }
+                }
+            }
+
             // ── Single-marker delete confirmation (MarkerList view) ───────────
             if app.marker_del_confirm {
                 let buf = f.buffer_mut();
@@ -480,11 +638,32 @@ fn run_app(
                     continue;
                 }
 
+                // ── Calculator view key handling ──────────────────────────────
+                if app.view == View::Calculator {
+                    handle_calc_keys(&mut app, key.code);
+                    continue;
+                }
+
+                // ── Shape editor key handling ─────────────────────────────────
+                if app.view == View::ShapeEditor {
+                    handle_shape_keys(&mut app, key.code);
+                    continue;
+                }
+
+                // ── Layer info overlay ────────────────────────────────────────
+                if app.layer_info {
+                    app.layer_info = false;  // any key closes it
+                    continue;
+                }
+
                 // ── Layers view key handling ──────────────────────────────────
                 if app.view == View::Layers {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                             app.view = app.layers_prev_view;
+                        }
+                        KeyCode::Char('i') | KeyCode::Char('I') => {
+                            app.layer_info = !app.layer_info;
                         }
                         KeyCode::Up => {
                             if app.layer_list_sel > 0 { app.layer_list_sel -= 1; }
@@ -643,8 +822,10 @@ fn run_app(
                         _ => {}
                     },
 
-                    // View::Layers is handled above with an early `continue`.
-                    View::Layers => {}
+                    // View::Layers, View::Calculator and View::ShapeEditor are handled above.
+                    View::Layers      => {}
+                    View::Calculator  => {}
+                    View::ShapeEditor => {}
                 }
             }
         }
@@ -840,6 +1021,295 @@ fn handle_marker_input(app: &mut App, code: KeyCode) {
             // Commit the marker
             commit_marker_input(app);
         }
+    }
+}
+
+// ── Shape editor key handler ───────────────────────────────────────────────────
+
+fn handle_shape_keys(app: &mut App, code: KeyCode) {
+    use console_gis::geo::LatLon;
+
+    match app.shape_editor.step {
+        // ── Step 1: select geometry type ──────────────────────────────────────
+        ShapeEditorStep::SelectType => match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                app.navigate(View::Menu);
+            }
+            KeyCode::Up => {
+                if app.shape_editor.type_idx > 0 {
+                    app.shape_editor.type_idx -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if app.shape_editor.type_idx + 1 < ShapeType::ALL.len() {
+                    app.shape_editor.type_idx += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                app.shape_editor.step = ShapeEditorStep::AddVertices;
+            }
+            KeyCode::Char(c) => {
+                if let Some(idx) = ShapeType::ALL.iter().position(|t| t.key() == c) {
+                    app.shape_editor.type_idx = idx;
+                    app.shape_editor.step = ShapeEditorStep::AddVertices;
+                }
+            }
+            _ => {}
+        },
+
+        // ── Step 2: add coordinates ────────────────────────────────────────────
+        ShapeEditorStep::AddVertices => match code {
+            KeyCode::Esc => {
+                app.shape_editor.step = ShapeEditorStep::SelectType;
+                app.shape_editor.message = None;
+            }
+            KeyCode::Tab => {
+                app.shape_editor.coord_field = 1 - app.shape_editor.coord_field;
+                app.shape_editor.message = None;
+            }
+            KeyCode::Enter => {
+                if app.shape_editor.coord_field == 0 {
+                    // Move focus to lon field
+                    app.shape_editor.coord_field = 1;
+                } else {
+                    // Commit the vertex
+                    match app.shape_editor.commit_vertex() {
+                        Ok(()) => {
+                            // For Point type, auto-advance after first coord
+                            if app.shape_editor.current_type() == ShapeType::Point
+                                && app.shape_editor.total_coords() >= 1
+                            {
+                                app.shape_editor.step = ShapeEditorStep::EnterName;
+                            }
+                        }
+                        Err(e) => { app.shape_editor.message = Some(e); }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                let field = app.shape_editor.coord_field;
+                if field == 0 {
+                    app.shape_editor.lat_buf.pop();
+                } else {
+                    app.shape_editor.lon_buf.pop();
+                }
+                app.shape_editor.message = None;
+            }
+            KeyCode::Up   => {
+                app.shape_editor.vert_scroll =
+                    app.shape_editor.vert_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = app.shape_editor.total_coords().saturating_sub(1);
+                if app.shape_editor.vert_scroll < max {
+                    app.shape_editor.vert_scroll += 1;
+                }
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                // Finish current part (multi-types only)
+                if app.shape_editor.current_type().is_multi() {
+                    match app.shape_editor.finish_part() {
+                        Ok(()) => {}
+                        Err(e) => { app.shape_editor.message = Some(e); }
+                    }
+                } else {
+                    app.shape_editor.message =
+                        Some("F is only for multi-geometry types.".into());
+                }
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                app.shape_editor.undo_vertex();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                // Validate enough coords, then advance
+                let min = app.shape_editor.current_type().min_coords_per_part();
+                if app.shape_editor.total_coords() < min {
+                    app.shape_editor.message = Some(format!(
+                        "Need ≥{min} coordinate{} for {}.",
+                        if min == 1 { "" } else { "s" },
+                        app.shape_editor.current_type().name(),
+                    ));
+                } else {
+                    app.shape_editor.step = ShapeEditorStep::EnterName;
+                    app.shape_editor.message = None;
+                }
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                let field = app.shape_editor.coord_field;
+                if field == 0 {
+                    app.shape_editor.lat_buf.push(c);
+                } else {
+                    app.shape_editor.lon_buf.push(c);
+                }
+                app.shape_editor.message = None;
+            }
+            _ => {}
+        },
+
+        // ── Step 3: feature name ──────────────────────────────────────────────
+        ShapeEditorStep::EnterName => match code {
+            KeyCode::Esc => {
+                app.shape_editor.step = ShapeEditorStep::AddVertices;
+            }
+            KeyCode::Backspace => { app.shape_editor.name_buf.pop(); }
+            KeyCode::Enter | KeyCode::Tab => {
+                app.shape_editor.step = ShapeEditorStep::EnterExportPath;
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                app.shape_editor.name_buf.push(c);
+            }
+            _ => {}
+        },
+
+        // ── Step 4: export path ───────────────────────────────────────────────
+        ShapeEditorStep::EnterExportPath => match code {
+            KeyCode::Esc => {
+                app.shape_editor.step = ShapeEditorStep::EnterName;
+                app.shape_editor.message = None;
+            }
+            KeyCode::Backspace => { app.shape_editor.export_buf.pop(); }
+            KeyCode::Enter => {
+                app.shape_editor.export();
+                // If successful, offer to load as a layer immediately
+                if let Some(ref msg) = app.shape_editor.message {
+                    if msg.starts_with("Saved") {
+                        let path = app.shape_editor.export_buf.trim().to_string();
+                        let _ = app.load_geo_layer(&path);
+                    }
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                // Q without Esc = quit to menu (useful after a successful export)
+                app.shape_editor.reset();
+                app.navigate(View::Menu);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                // R = reset for a new shape
+                app.shape_editor.reset();
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                app.shape_editor.export_buf.push(c);
+                app.shape_editor.message = None;
+            }
+            _ => {}
+        },
+    }
+}
+
+// ── Calculator key handler ─────────────────────────────────────────────────────
+
+fn handle_calc_keys(app: &mut App, code: KeyCode) {
+    use console_gis::geo::LatLon;
+
+    // Result placement actions work when we have a lat/lon result.
+    let result_latlon: Option<(f64, f64)> = app.calc.result.as_ref()
+        .and_then(|r| r.latlon);
+
+    match code {
+        // ── Navigation ────────────────────────────────────────────────────────
+        KeyCode::Esc => {
+            if app.calc.focus_right {
+                app.calc.focus_right = false;
+            } else {
+                app.navigate(View::Menu);
+            }
+        }
+
+        KeyCode::Up => {
+            if app.calc.focus_right {
+                if app.calc.field_idx > 0 { app.calc.field_idx -= 1; }
+            } else if app.calc.mode_idx > 0 {
+                app.calc.set_mode(app.calc.mode_idx - 1);
+            }
+        }
+
+        KeyCode::Down => {
+            if app.calc.focus_right {
+                let max = app.calc.current_mode().field_labels().len().saturating_sub(1);
+                if app.calc.field_idx < max { app.calc.field_idx += 1; }
+            } else if app.calc.mode_idx + 1 < CalcMode::ALL.len() {
+                app.calc.set_mode(app.calc.mode_idx + 1);
+            }
+        }
+
+        KeyCode::Tab => {
+            if app.calc.focus_right {
+                let max = app.calc.current_mode().field_labels().len();
+                app.calc.field_idx = (app.calc.field_idx + 1) % max;
+            } else {
+                app.calc.focus_right = true;
+            }
+        }
+
+        KeyCode::Enter => {
+            if !app.calc.focus_right {
+                app.calc.focus_right = true;
+            } else {
+                let max = app.calc.current_mode().field_labels().len().saturating_sub(1);
+                if app.calc.field_idx < max {
+                    app.calc.field_idx += 1;
+                } else {
+                    app.calc.compute();
+                }
+            }
+        }
+
+        KeyCode::Backspace => {
+            if app.calc.focus_right {
+                app.calc.fields[app.calc.field_idx].pop();
+                app.calc.result = None;
+                app.calc.error  = None;
+            }
+        }
+
+        // ── Result actions (available when not editing a field) ───────────────
+        KeyCode::Char('p') | KeyCode::Char('P') if !app.calc.focus_right => {
+            if let Some((lat, lon)) = result_latlon {
+                app.marker_input = Some(MarkerInput {
+                    lat, lon,
+                    symbol_buf: String::new(),
+                    label_buf:  String::new(),
+                    blink:      false,
+                    step:       MarkerInputStep::Symbol,
+                    edit_id:    None,
+                });
+            }
+        }
+
+        KeyCode::Char('g') | KeyCode::Char('G') if !app.calc.focus_right => {
+            if let Some((lat, lon)) = result_latlon {
+                app.globe.rot_y = lon.to_radians();
+                app.globe.rot_x = -lat.to_radians();
+                app.animating   = false;
+                app.navigate(View::Globe);
+            }
+        }
+
+        KeyCode::Char('m') | KeyCode::Char('M') if !app.calc.focus_right => {
+            if let Some((lat, lon)) = result_latlon {
+                app.map_centre = LatLon::new(lat, lon);
+                app.navigate(View::Map);
+            }
+        }
+
+        // ── Character input ───────────────────────────────────────────────────
+        KeyCode::Char(c) => {
+            if app.calc.focus_right {
+                // Type into the current field
+                app.calc.fields[app.calc.field_idx].push(c);
+                app.calc.result = None;
+                app.calc.error  = None;
+            } else {
+                // Number shortcuts to jump to a calculator
+                if let Some(idx) = CalcMode::ALL.iter().position(|m| m.key() == c) {
+                    app.calc.set_mode(idx);
+                } else if c == 'q' || c == 'Q' {
+                    app.navigate(View::Menu);
+                }
+            }
+        }
+
+        _ => {}
     }
 }
 
