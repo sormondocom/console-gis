@@ -12,6 +12,10 @@
 [![VT-100](https://img.shields.io/badge/terminal-VT--100%20compatible-green)](#terminal-capability-tiers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](#license)
 
+<br>
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support%20this%20project-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/sormondocom)
+
 </div>
 
 ---
